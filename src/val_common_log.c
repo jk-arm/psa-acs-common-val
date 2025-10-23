@@ -5,6 +5,9 @@
  *
  */
 
+#include <limits.h>
+#include <stdint.h>
+
 #include "val_common_log.h"
 #include "val_common_framework.h"
 
@@ -36,10 +39,14 @@ enum format_base {
 };
 
 enum format_length {
-    length8 = 8,
-    length16 = 16,
-    length32 = 32,
-    length64 = 64,
+    length_char,
+    length_short,
+    length_int,
+    length_long,
+    length_long_long,
+    length_intmax,
+    length_size,
+    length_ptrdiff,
 };
 
 #ifndef STATIC_ASSERT_CHECKS
@@ -67,6 +74,7 @@ static_assert(sizeof(ptrdiff_t) == sizeof(uint64_t),
  */
 size_t log_buffer_offset;
 char log_buffer[LOG_BUFFER_SIZE];
+static const char null_log_message[] = "(null)";
 
 /**
  *   @brief    - Stores a character in a log buffer and outputs it via 'val_putc'
@@ -286,30 +294,34 @@ static const char *parse_length_modifier(const char *fmt,
         fmt++;
         if (*fmt == 'h') {
             fmt++;
-            *length = length8;
+            *length = length_char;
         } else {
-            *length = length16;
+            *length = length_short;
         }
         break;
     case 'l':
         fmt++;
         if (*fmt == 'l') {
             fmt++;
-            *length = length64;
+            *length = length_long_long;
         } else {
-            *length = length64;
+            *length = length_long;
         }
         break;
-
     case 'j':
+        fmt++;
+        *length = length_intmax;
+        break;
     case 'z':
+        fmt++;
+        *length = length_size;
+        break;
     case 't':
         fmt++;
-        *length = length64;
+        *length = length_ptrdiff;
         break;
-
     default:
-        *length = length32;
+        *length = length_int;
         break;
     }
 
@@ -329,18 +341,31 @@ static const char *parse_min_width(const char *fmt, va_list args,
                    struct format_flags *flags, int *min_width)
 {
     int width = 0;
+    const int max_tens = INT_MAX / 10;
+    const int max_units = INT_MAX % 10;
 
     /* Read minimum width from arguments. */
     if (*fmt == '*') {
         fmt++;
-        width = va_arg(args, int);
-        if (width < 0) {
-            width = -width;
+        int arg_width = va_arg(args, int);
+        if (arg_width < 0) {
             flags->minus = true;
+            if (arg_width == INT_MIN) {
+                width = INT_MAX;
+            } else {
+                width = -arg_width;
+            }
+        } else {
+            width = arg_width;
         }
     } else {
         for (; *fmt >= '0' && *fmt <= '9'; fmt++) {
-            width = (width * 10) + (*fmt - '0');
+            int digit = *fmt - '0';
+            if (width > max_tens || (width == max_tens && digit > max_units)) {
+                width = INT_MAX;
+            } else {
+                width = (width * 10) + digit;
+            }
         }
     }
 
@@ -360,13 +385,17 @@ static const char *parse_min_width(const char *fmt, va_list args,
 static uint64_t reinterpret_unsigned_int(enum format_length length, uint64_t value)
 {
     switch (length) {
-    case length8:
+    case length_char:
         return (uint8_t)value;
-    case length16:
+    case length_short:
         return (uint16_t)value;
-    case length32:
+    case length_int:
         return (uint32_t)value;
-    case length64:
+    case length_long:
+    case length_long_long:
+    case length_intmax:
+    case length_size:
+    case length_ptrdiff:
         return value;
     }
     return 0;
@@ -387,33 +416,85 @@ static uint64_t reinterpret_signed_int(enum format_length length, uint64_t value
     int64_t signed_value = (int64_t)reinterpret_unsigned_int(length, value);
 
     switch (length) {
-    case length8:
+    case length_char:
         if ((int8_t)signed_value < 0) {
             flags->neg = true;
             signed_value = (-signed_value) & 0xFF;
         }
         break;
-    case length16:
+    case length_short:
         if ((int16_t)signed_value < 0) {
             flags->neg = true;
             signed_value = (-signed_value) & 0xFFFF;
         }
         break;
-    case length32:
+    case length_int:
         if ((int32_t)signed_value < 0) {
             flags->neg = true;
             signed_value = (-signed_value) & 0xFFFFFFFF;
         }
         break;
-    case length64:
+    case length_long:
+    case length_long_long:
+    case length_intmax:
+    case length_size:
+    case length_ptrdiff:
         if ((int64_t)signed_value < 0) {
             flags->neg = true;
+            if ((int64_t)signed_value == INT64_MIN) {
+                return 1ULL << 63;
+            }
             signed_value = -signed_value;
         }
         break;
     }
 
     return (uint64_t)signed_value;
+}
+
+static uint64_t read_signed_argument(va_list *args, enum format_length length)
+{
+    switch (length) {
+    case length_char:
+    case length_short:
+    case length_int:
+        return (uint64_t)va_arg(*args, int);
+    case length_long:
+        return (uint64_t)va_arg(*args, long);
+    case length_long_long:
+        return (uint64_t)va_arg(*args, long long);
+    case length_intmax:
+        return (uint64_t)va_arg(*args, intmax_t);
+    case length_size:
+        return (uint64_t)va_arg(*args, size_t);
+    case length_ptrdiff:
+        return (uint64_t)va_arg(*args, ptrdiff_t);
+    }
+    return 0;
+}
+
+static uint64_t read_unsigned_argument(va_list *args, enum format_length length)
+{
+    switch (length) {
+    case length_char:
+    case length_short: {
+        int value = va_arg(*args, int);
+        return (uint64_t)(unsigned int)value;
+    }
+    case length_int:
+        return (uint64_t)va_arg(*args, unsigned int);
+    case length_long:
+        return (uint64_t)va_arg(*args, unsigned long);
+    case length_long_long:
+        return (uint64_t)va_arg(*args, unsigned long long);
+    case length_intmax:
+        return (uint64_t)va_arg(*args, uintmax_t);
+    case length_size:
+        return (uint64_t)va_arg(*args, size_t);
+    case length_ptrdiff:
+        return (uint64_t)va_arg(*args, ptrdiff_t);
+    }
+    return 0;
 }
 
 /**
@@ -438,7 +519,7 @@ static size_t val_log(const char *fmt, va_list args)
         case '%': {
             struct format_flags flags = {0};
             int min_width = 0;
-            enum format_length length = length32;
+            enum format_length length = length_int;
             uint64_t value;
 
             fmt++;
@@ -465,17 +546,18 @@ static size_t val_log(const char *fmt, va_list args)
 
             case 's': {
                 char *str = va_arg(args, char *);
+                const char *safe_str = (str != NULL) ? str : "(null)";
 
                 fmt++;
                 chars_written += print_string(
-                    str, str, min_width, &flags, ' ');
+                    safe_str, safe_str, min_width, &flags, ' ');
                 break;
             }
 
             case 'd':
             case 'i': {
                 fmt++;
-                value = va_arg(args, uint64_t);
+                value = read_signed_argument(&args, length);
                 value = reinterpret_signed_int(length, value,
                                    &flags);
 
@@ -486,7 +568,7 @@ static size_t val_log(const char *fmt, va_list args)
 
             case 'b':
                 fmt++;
-                value = va_arg(args, uint64_t);
+                value = read_unsigned_argument(&args, length);
                 value = reinterpret_unsigned_int(length, value);
 
                 chars_written += print_int(value, base2,
@@ -496,7 +578,7 @@ static size_t val_log(const char *fmt, va_list args)
             case 'B':
                 fmt++;
                 flags.upper = true;
-                value = va_arg(args, uint64_t);
+                value = read_unsigned_argument(&args, length);
                 value = reinterpret_unsigned_int(length, value);
 
                 chars_written += print_int(value, base2,
@@ -505,7 +587,7 @@ static size_t val_log(const char *fmt, va_list args)
 
             case 'o':
                 fmt++;
-                value = va_arg(args, uint64_t);
+                value = read_unsigned_argument(&args, length);
                 value = reinterpret_unsigned_int(length, value);
 
                 chars_written += print_int(value, base8,
@@ -514,7 +596,7 @@ static size_t val_log(const char *fmt, va_list args)
 
             case 'x':
                 fmt++;
-                value = va_arg(args, uint64_t);
+                value = read_unsigned_argument(&args, length);
                 value = reinterpret_unsigned_int(length, value);
 
                 chars_written += print_int(value, base16,
@@ -524,7 +606,7 @@ static size_t val_log(const char *fmt, va_list args)
             case 'X':
                 fmt++;
                 flags.upper = true;
-                value = va_arg(args, uint64_t);
+                value = read_unsigned_argument(&args, length);
                 value = reinterpret_unsigned_int(length, value);
 
                 chars_written += print_int(value, base16,
@@ -533,7 +615,7 @@ static size_t val_log(const char *fmt, va_list args)
 
             case 'u':
                 fmt++;
-                value = va_arg(args, uint64_t);
+                value = read_unsigned_argument(&args, length);
                 value = reinterpret_unsigned_int(length, value);
 
                 chars_written += print_int(value, base10,
@@ -542,7 +624,7 @@ static size_t val_log(const char *fmt, va_list args)
 
             case 'p':
                 fmt++;
-                value = va_arg(args, uint64_t);
+                value = (uint64_t)(uintptr_t)va_arg(args, void *);
                 min_width = sizeof(size_t) * 2 + 2;
                 flags.zero = true;
                 flags.alt = true;
@@ -585,15 +667,16 @@ out:
  *             - ...        : ellipses for variadic args
  *   @return   - SUCCESS((Any positive number for character written)/FAILURE(0)
  **/
-uint32_t val_printf(print_verbosity_t verbosity, const char *msg, ...)
+uint32_t val_printf(print_verbosity_t verbosity, const char *fmt, ...)
 {
     size_t chars_written = 0;
-    size_t len = log_strnlen_s(msg, LOG_MAX_STRING_LENGTH - 2);
+    const char *format_msg = (fmt != NULL) ? fmt : null_log_message;
+    size_t len = log_strnlen_s(format_msg, LOG_MAX_STRING_LENGTH - 2);
     static bool lastWasNewline = true;
     char formatted_msg[LOG_MAX_STRING_LENGTH];
     va_list args;
 
-    va_start(args, msg);
+    va_start(args, fmt);
 
     if (verbosity >= VERBOSITY)
     {
@@ -630,9 +713,12 @@ uint32_t val_printf(print_verbosity_t verbosity, const char *msg, ...)
             }
         }
 
-        if (len > 0 && msg[len - 1] == '\n')
+        const bool has_newline = (len > 0) && (format_msg[len - 1] == '\n');
+        const bool truncated = (len == LOG_MAX_STRING_LENGTH - 2); /* log_strnlen_s hit the scan limit */
+
+        if (has_newline)
         {
-            val_mem_copy(formatted_msg, msg, len - 1);
+            val_mem_copy(formatted_msg, sizeof(formatted_msg), format_msg, len - 1);
             formatted_msg[len - 1] = '\r';
             formatted_msg[len] = '\n';
             formatted_msg[len + 1] = '\0';
@@ -642,7 +728,16 @@ uint32_t val_printf(print_verbosity_t verbosity, const char *msg, ...)
         }
         else
         {
-            chars_written = val_log(msg, args);
+            if (truncated)
+            {
+                val_mem_copy(formatted_msg, sizeof(formatted_msg), format_msg, len);
+                formatted_msg[len] = '\0';
+                chars_written = val_log(formatted_msg, args);
+            }
+            else
+            {
+                chars_written = val_log(format_msg, args);
+            }
             lastWasNewline = false;
         }
     }
