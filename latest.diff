@@ -1,0 +1,64 @@
+diff --git a/src/val_common_log.c b/src/val_common_log.c
+index d30ada7..0032541 100644
+--- a/src/val_common_log.c
++++ b/src/val_common_log.c
+@@ -7,6 +7,7 @@
+ 
+ #include <limits.h>
+ #include <stdint.h>
++#include <stdatomic.h>
+ 
+ #include "val_common_log.h"
+ #include "val_common_framework.h"
+@@ -75,6 +76,38 @@ static_assert(sizeof(ptrdiff_t) == sizeof(uint64_t),
+ size_t log_buffer_offset;
+ char log_buffer[LOG_BUFFER_SIZE];
+ static const char null_log_message[] = "(null)";
++#ifndef STATIC_ASSERT_CHECKS
++static_assert(LOG_BUFFER_SIZE > 0, "LOG_BUFFER_SIZE must be greater than 0");
++#endif
++static atomic_flag log_buffer_lock = ATOMIC_FLAG_INIT;
++
++static void log_buffer_acquire(void)
++{
++    while (atomic_flag_test_and_set_explicit(&log_buffer_lock, memory_order_acquire)) {
++    }
++}
++
++static void log_buffer_release(void)
++{
++    atomic_flag_clear_explicit(&log_buffer_lock, memory_order_release);
++}
++
++static size_t log_reserve_index(void)
++{
++    size_t index = log_buffer_offset;
++
++    if (index >= LOG_BUFFER_SIZE) {
++        index %= LOG_BUFFER_SIZE;
++    }
++
++    size_t next = index + 1;
++    if (next >= LOG_BUFFER_SIZE) {
++        next = 0;
++    }
++
++    log_buffer_offset = next;
++    return index;
++}
+ 
+ /**
+  *   @brief    - Stores a character in a log buffer and outputs it via 'val_putc'
+@@ -84,8 +117,10 @@ static const char null_log_message[] = "(null)";
+ 
+ static void log_putchar(char c)
+ {
+-    log_buffer[log_buffer_offset] = c;
+-    log_buffer_offset = (log_buffer_offset + 1) % LOG_BUFFER_SIZE;
++    log_buffer_acquire();
++    size_t index = log_reserve_index();
++    log_buffer[index] = c;
++    log_buffer_release();
+ 
+     val_putc(&c);
+ }
